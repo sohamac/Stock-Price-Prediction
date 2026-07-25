@@ -1,19 +1,44 @@
-This project focuses on processing and analyzing stock market data using Apache Spark and building a Long Short-Term Memory (LSTM) neural network model for predicting stock price movements. The project utilizes Spark's data processing capabilities to preprocess and engineer features from historical stock data. The engineered features include moving averages, Bollinger Bands, Relative Strength Index (RSI), Moving Average Convergence Divergence (MACD), Stochastic Oscillator, and Commodity Channel Index (CCI).
+# Stock Price Movement Prediction
 
-The LSTM model is developed using PyTorch to predict whether the stock price will move up or down based on the extracted features. The model takes into account the scaled features of the previous 10 rows to make predictions for the next data point. The project involves training and evaluating the LSTM model on both training and test data sections, assessing its accuracy and performance for stock movement prediction.
+An experiment combining PySpark for technical-indicator feature engineering with a PyTorch LSTM for binary up/down price movement classification.
 
-Key Steps:
+## What this actually does
 
-1. Data Preprocessing: Spark is employed to preprocess and engineer various technical indicators and features from historical stock data. Sections of data are created to facilitate efficient processing.
+1. **`data_scraping.py`** -- scrapes intraday price ticks for a single hardcoded stock/date from Google Finance using Selenium + `pyautogui` mouse simulation, and writes them to a CSV in `stock_data/`.
+2. **`data_analysis.py`** -- the main pipeline:
+   - Loads CSVs from `stock_data/` into Spark DataFrames.
+   - Computes technical indicators (moving averages, Bollinger Bands, RSI, MACD, stochastic oscillator, CCI) using Spark window functions.
+   - Assembles and standard-scales the indicators into a feature vector per row.
+   - Labels each row `up`/`down` based on whether the next-10-tick average price is higher than the last-10-tick average.
+   - Slices each stock's time series into overlapping 150-row sections (150-row window, 25-row stride).
+   - Converts sections to pandas once per section (`toPandas()`) and builds fixed-length (10-timestep) sequences for an LSTM.
+   - Trains a single-layer LSTM with mini-batch SGD (batch size 32) to predict the next tick's up/down movement.
 
-2. Feature Engineering: Various technical indicators including moving averages, Bollinger Bands, RSI, MACD, Stochastic Oscillator, and CCI are calculated using the historical stock data.
+## Architecture note: where Spark's job ends
 
-3. Model Development: An LSTM neural network model is built using PyTorch to predict stock price movements. The model takes scaled features of the last 10 rows as input and predicts the movement class as "up" or "down" for the current row.
+Spark does the feature engineering (technical indicators via window functions) -- that part is genuinely distributed computation. Once the feature vectors are ready, the code hands off to pandas/PyTorch for sequence windowing and LSTM training, which runs on the driver. This is a normal and common split (Spark for ETL/feature engineering, single-machine deep learning for sequence modeling), **not** a distributed training job -- so "processes massive historical stock datasets" should be read as "the feature engineering step is distributed; the model training step is not."
 
-4. Training and Evaluation: The LSTM model is trained on the training data sections and evaluated for accuracy and performance on the test data sections. The model's performance is monitored to assess its effectiveness in predicting stock price movements.
+## Known Limitations
 
-Overall, the project combines the power of Apache Spark for efficient data processing and PyTorch for developing a robust LSTM model, enabling accurate predictions for stock price movements.
+- **Data scraping is fragile.** `data_scraping.py` hardcodes a single stock ticker and date, requires a Windows-specific ChromeDriver path, and drives the page via `pyautogui` mouse movement rather than a stable API or headless scraping approach. It's a one-off script, not a repeatable data pipeline.
+- **`toPandas()` per section means this doesn't scale to datasets larger than driver memory.** Each 150-row section is pulled to the driver individually during training-data preparation. For genuinely large datasets, sequences would need to be written to disk (e.g. Parquet) and streamed via a custom `IterableDataset` instead of collected in memory up front.
+- **No train/validation split for hyperparameter tuning** -- only a train/test split. No learning rate scheduling, early stopping, or hyperparameter search.
+- **Single LSTM layer, fixed hidden size (200)** with no dropout or regularization -- likely to overfit on small per-stock datasets.
+- **Labeling is naive:** any next-10-average strictly greater than last-10-average counts as "up," with no threshold for noise -- small fluctuations near zero are labeled the same as strong moves.
 
+## Running it
 
+```bash
+pip install -r requirements.txt
+# Requires stock_data/ to contain one or more CSVs with a `price` and `Time` column
+python data_analysis.py
+```
 
+Data scraping (optional, requires Chrome + chromedriver on the system PATH, and edits to the `stock` / `date` variables at the top of the file):
+```bash
+python data_scraping.py
+```
 
+## License
+
+MIT
