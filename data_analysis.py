@@ -11,7 +11,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 
-# Create a Spark session
+# Create a Spark session.
 spark = SparkSession.builder \
     .appName("stock_data_processing") \
     .getOrCreate()
@@ -25,50 +25,62 @@ path = "stock_data/"
 sections_list = []
 
 SEQUENCE_LENGTH = 10  # number of timesteps fed into the LSTM per training example
+SECTION_LENGTH = 150  # rows per training window
+STEP_SIZE = 25        # stride between windows
 
 
 # Function to read the data and create sections
 def process_file(file_path):
-    df = spark.read.option("header", "true").csv(file_path)
-    step_size = 25
-    section_length = 150
+    # inferSchema converts the Price column to a real number automatically,
+    # since the CSV now contains plain numeric values (from yfinance) rather
+    # than text -- this is what was previously causing DATATYPE_MISMATCH.
+    df = spark.read.option("header", "true").option("inferSchema", "true").csv(file_path)
+    df = df.withColumn("Price", F.col("Price").cast("float"))
+
+    row_count = df.count()
+    if row_count < SECTION_LENGTH:
+        print(f"  Skipping {file_path}: only {row_count} rows, "
+              f"need at least {SECTION_LENGTH} to build one training window.")
+        return []
 
     window = Window.orderBy(F.monotonically_increasing_id())
     df = df.withColumn("row_num", F.row_number().over(window))
 
-    df = df.withColumn('next5_avg', F.avg('price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(1, 5)))
-    df = df.withColumn('last5_avg', F.avg('price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-4, -0)))
+    df = df.withColumn('next5_avg', F.avg('Price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(1, 5)))
+    df = df.withColumn('last5_avg', F.avg('Price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-4, -0)))
 
-    df = df.withColumn('next10_avg', F.avg('price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(1, 10)))
-    df = df.withColumn('last10_avg', F.avg('price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-9, -0)))
+    df = df.withColumn('next10_avg', F.avg('Price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(1, 10)))
+    df = df.withColumn('last10_avg', F.avg('Price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-9, -0)))
 
     # Moving Averages (MA)
-    df = df.withColumn('ma_5', F.avg('price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-4, 0)))
-    df = df.withColumn('ma_10', F.avg('price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-9, 0)))
+    df = df.withColumn('ma_5', F.avg('Price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-4, 0)))
+    df = df.withColumn('ma_10', F.avg('Price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-9, 0)))
 
     # Bollinger Bands
-    rolling_std = F.stddev('price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-9, 0))
+    rolling_std = F.stddev('Price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-9, 0))
     df = df.withColumn('rolling_std', rolling_std)
     df = df.withColumn('upper_band', F.col('ma_10') + 2 * rolling_std)
     df = df.withColumn('lower_band', F.col('ma_10') - 2 * rolling_std)
 
     # RSI
     rsi_period = 14
-    price_diff = F.col('price') - F.lag(F.col('price'), 1).over(Window.orderBy(F.monotonically_increasing_id()))
+    price_diff = F.col('Price') - F.lag(F.col('Price'), 1).over(Window.orderBy(F.monotonically_increasing_id()))
     gain = F.when(price_diff > 0, price_diff).otherwise(0)
     loss = F.when(price_diff < 0, -price_diff).otherwise(0)
     avg_gain = F.avg(gain).over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-rsi_period + 1, 0))
     avg_loss = F.avg(loss).over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-rsi_period + 1, 0))
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
+    # avg_loss == 0 means price only went up in that window -- RSI is defined
+    # as 100 in that case (fully overbought), not an error.
     df = df.withColumn('rsi', F.when(avg_loss == 0, 100).otherwise(rsi))
 
     # MACD
     short_term_period = 12
     long_term_period = 26
     signal_period = 9
-    ema_short = F.avg('price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-short_term_period + 1, 0))
-    ema_long = F.avg('price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-long_term_period + 1, 0))
+    ema_short = F.avg('Price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-short_term_period + 1, 0))
+    ema_long = F.avg('Price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-long_term_period + 1, 0))
     macd = ema_short - ema_long
     signal_line = F.avg(macd).over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-signal_period + 1, 0))
     df = df.withColumn('macd', macd)
@@ -77,24 +89,33 @@ def process_file(file_path):
     # Stochastic Oscillator
     k_period = 14
     d_period = 3
-    k_values = 100 * (df['price'] - F.min('price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-k_period + 1, 0))) / (
-            F.max('price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-k_period + 1, 0)) - F.min('price').over(
-        Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-k_period + 1, 0)))
+    lowest = F.min('Price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-k_period + 1, 0))
+    highest = F.max('Price').over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-k_period + 1, 0))
+    price_range = highest - lowest
+    # When the price hasn't moved at all in the last 14 ticks, highest == lowest,
+    # so this division would be 0/0. Instead of letting that crash the job (or
+    # silently turning it into a NULL and dropping the row later, which loses
+    # real data), treat a flat window as "neutral" -- 50 is the midpoint of the
+    # 0-100 stochastic scale, meaning neither overbought nor oversold.
+    k_values = F.when(price_range == 0, F.lit(50.0)).otherwise(
+        100 * (df['Price'] - lowest) / price_range
+    )
     d_values = F.avg(k_values).over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-d_period + 1, 0))
     df = df.withColumn('stochastic_k', k_values)
     df = df.withColumn('stochastic_d', d_values)
 
     # CCI
     cci_period = 20
-    typical_price = (df['price'] + df['price'] + df['price']) / 3
+    typical_price = (df['Price'] + df['Price'] + df['Price']) / 3
     mean_deviation = F.avg(F.abs(typical_price - F.avg(typical_price).over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-cci_period + 1, 0)))
                         ).over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-cci_period + 1, 0))
-    cci = (typical_price - F.avg(typical_price).over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-cci_period + 1, 0))) / (0.015 * mean_deviation)
-    df = df.withColumn('cci', cci)
+    # Same flat-price situation can zero out mean_deviation here too.
+    cci_raw = (typical_price - F.avg(typical_price).over(Window.orderBy(F.monotonically_increasing_id()).rowsBetween(-cci_period + 1, 0))) / (0.015 * mean_deviation)
+    df = df.withColumn('cci', F.when(mean_deviation == 0, F.lit(0.0)).otherwise(cci_raw))
 
-    # remove rows with nulls
+    # remove rows with nulls (mostly the first few rows of each window, before
+    # enough history has accumulated to compute the longer indicators)
     df = df.na.drop()
-    df = df.withColumn("Price", df["Price"].cast("float"))
 
     indicator_columns = ['Price', 'ma_5', 'ma_10', 'rolling_std', 'upper_band', 'lower_band', 'rsi', 'macd', 'signal_line', 'stochastic_k', 'stochastic_d', 'cci']
     scaler = StandardScaler(inputCol="features", outputCol="scaled_features", withStd=True, withMean=True)
@@ -109,9 +130,10 @@ def process_file(file_path):
                        .otherwise('down'))
 
     temp_section_list = []
-    for i in range(1, df.count() - section_length + 2, step_size):
+    remaining_rows = df.count()
+    for i in range(1, remaining_rows - SECTION_LENGTH + 2, STEP_SIZE):
         section = df.filter((F.col("row_num") >= i) & (
-            F.col("row_num") < i + section_length))
+            F.col("row_num") < i + SECTION_LENGTH))
         temp_section_list.append(section)
     return temp_section_list
 
@@ -123,6 +145,13 @@ for file in os.listdir(path):
         sections_list.extend(process_file(file_path))
 
 print(f"Total sections: {len(sections_list)}")
+
+if not sections_list:
+    raise RuntimeError(
+        "No training sections were produced from any file in stock_data/. "
+        "Check that data_scraping.py ran successfully and each CSV has at "
+        f"least {SECTION_LENGTH} rows."
+    )
 
 
 class LSTMModel(nn.Module):
