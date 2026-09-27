@@ -1,100 +1,80 @@
 import os
-from selenium import webdriver
-from selenium.webdriver.common.by import By
 import time
-import pyautogui
-import re
-from datetime import datetime
-import csv
+import pandas as pd
+import yfinance as yf
 
-# stock = "RELIANCE"
-# stock = "BSE"
-# stock = "INFY"
-# stock = "WIPRO"
-# stock = "AXISBANK"
-# stock = "TATASTEEL"
-# stock = "ICICIBANK"
-# stock = "MARUTI"
-# stock = "ITC"
-stock = "SUNPHARMA"
+# How much history to pull and at what resolution. Yahoo only keeps 5-minute
+# bars for the last 60 days, so 1 month is safely within that limit.
+PERIOD = "1mo"
+INTERVAL = "5m"
 
-# date = "2023-10-17"
-date = "2023-10-18"
+# data_analysis.py slices each stock into overlapping 150-row windows.
+# If a stock comes back with fewer rows than this, that stock can't
+# produce even a single window downstream -- better to catch it here
+# with a clear warning than let data_analysis.py fail later.
+MIN_ROWS_REQUIRED = 150
 
-os.environ["PATH"] += r"C:/SeleniumDrivers"
-driver = webdriver.Chrome()
-driver.implicitly_wait(30)
 
-# url = 'https://www.google.com/finance/quote/RELIANCE:NSE'
-# url = 'https://www.google.com/finance/quote/BSE:NSE'
-# url = 'https://www.google.com/finance/quote/INFY:NSE'
-# url = 'https://www.google.com/finance/quote/WIPRO:NSE'
-# url = 'https://www.google.com/finance/quote/AXISBANK:NSE'
-# url = 'https://www.google.com/finance/quote/TATASTEEL:NSE'
-# url = 'https://www.google.com/finance/quote/ICICIBANK:NSE'
-# url = 'https://www.google.com/finance/quote/MARUTI:NSE'
-# url = 'https://www.google.com/finance/quote/ITC:NSE'
-url = 'https://www.google.com/finance/quote/SUNPHARMA:NSE'
+def fetch_data(stock_symbol: str, output_dir: str = "stock_data", retries: int = 3) -> bool:
+    """
+    Fetch intraday price history for one stock and save it as a CSV in the
+    schema data_analysis.py expects: Stock, Date, Time, Price.
 
-driver.get(url)
+    Returns True if a usable file was written, False otherwise -- so the
+    caller can report which stocks failed instead of the whole run stopping
+    at the first network error.
+    """
+    os.makedirs(output_dir, exist_ok=True)
 
-driver.implicitly_wait(30)
-
-data_store = dict()
-data_store[date] = {}
-
-data_rows = []
-
-csv_file_path = stock+" "+date+" data.csv"
-
-pyautogui.moveTo(100, 900)
-
-with open(csv_file_path, mode='w', newline='') as file:
-    writer = csv.writer(file)
-    writer.writerow(['Stock', 'Date', 'Time', 'Price'])
-    mov = 0
-    while mov<900 and len(data_store[date])<375:
-        mov+=1
-        pyautogui.moveTo(100+mov, 900)
-        # print(len(data_store[date]))
-        data = driver.find_elements(By.CLASS_NAME, 'hSGhwc')
+    last_error = None
+    for attempt in range(1, retries + 1):
         try:
-            data = data[0].text
-        except:
-            data = ""
+            print(f"Fetching data for {stock_symbol} (attempt {attempt}/{retries})...")
+            ticker = yf.Ticker(stock_symbol)
+            df = ticker.history(period=PERIOD, interval=INTERVAL)
+            break
+        except Exception as exc:
+            last_error = exc
+            print(f"  Network/API error for {stock_symbol}: {exc}")
+            if attempt < retries:
+                time.sleep(2 * attempt)  # back off a bit longer each retry
+    else:
+        print(f"  Giving up on {stock_symbol} after {retries} attempts ({last_error}).")
+        return False
 
-        if data:
-            data = re.split(" |\n|, |\u202f", data)
+    if df.empty:
+        print(f"  No data returned for {stock_symbol} -- check the ticker symbol.")
+        return False
 
-            date = data[2] + " " + data[3] + " " + data[4]
-            input_format = "%b %d %Y"
-            parsed_date = datetime.strptime(date, input_format)
-            output_format = "%Y-%m-%d"
-            date = parsed_date.strftime(output_format)
+    if len(df) < MIN_ROWS_REQUIRED:
+        print(f"  Warning: only {len(df)} rows for {stock_symbol}, "
+              f"need at least {MIN_ROWS_REQUIRED} for one training window. "
+              f"Saving anyway, but this stock likely won't contribute any sections.")
 
-            time1 = data[5] + " " + data[6]
-            input_format = "%I:%M %p"
-            parsed_time = datetime.strptime(time1, input_format)
-            output_format = "%H:%M"
-            time1 = parsed_time.strftime(output_format)
+    df = df.reset_index()
 
-            price = float(data[1][1:].replace(",", ""))
+    # yfinance intraday data has a 'Datetime' column
+    out = pd.DataFrame({
+        "Stock": stock_symbol,
+        "Date": df["Datetime"].dt.strftime("%Y-%m-%d"),
+        "Time": df["Datetime"].dt.strftime("%H:%M"),
+        "Price": df["Close"],
+    })
 
-            if date not in data_store:
-                data_store[date] = {}
-            if time1 not in data_store[date]:
-                data_store[date][time1] = price
-                # print(i)
-                print("Date:", date)
-                print("Time:", time1)
-                print("Price:", price)
-                print(len(data_store[date]))
-                # writer.writerow(data_row)
-    
-    # assuming data_store has data for a single date at a time
-    data_store = data_store[date]
-    data_store = list(data_store.items())
-    data_store.sort()
+    csv_file_path = os.path.join(output_dir, f"{stock_symbol}_data.csv")
+    out.to_csv(csv_file_path, index=False)
+    print(f"  Saved {len(out)} rows to {csv_file_path}")
+    return True
 
-    for i in data_store:
-        writer.writerow([stock, date, i[0], i[1]])
+
+if __name__ == "__main__":
+    # Indian stock tickers on Yahoo Finance have a .NS suffix for NSE
+    stocks = ["RELIANCE.NS", "INFY.NS", "WIPRO.NS", "SUNPHARMA.NS", "TCS.NS"]
+
+    succeeded, failed = [], []
+    for stock in stocks:
+        (succeeded if fetch_data(stock) else failed).append(stock)
+
+    print(f"\nDone. {len(succeeded)} succeeded, {len(failed)} failed.")
+    if failed:
+        print(f"Failed: {', '.join(failed)}")
